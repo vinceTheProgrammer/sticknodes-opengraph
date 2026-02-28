@@ -1,0 +1,22 @@
+[package]
+name = "sticknodes-opengraph"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["rustls-tls", "stream"] }
+wgpu = "0.19"
+image = "0.25"
+bytes = "1"
+snrs-render-core = { path = "../snrs-render-core" }
+sticknodes-rs = { path = "../sticknodes-rs", features = ["std"] }
+anyhow = "1.0.102"
+base64 = "0.22.1"
+bytemuck = { version = "1.25", features = ["derive"] }
+glam = "0.32.0"
+futures-util = "0.3.32"
+tower = { version = "0.5.3", features = ["limit"] }
+tower-http = "0.6.8"
+tower_governor = { version = "0.4.0" }
