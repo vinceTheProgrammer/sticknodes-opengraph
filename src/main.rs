@@ -1,7 +1,7 @@
 use std::{net::{IpAddr, SocketAddr}, sync::Arc, time::Duration};
-
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use axum::{
-    Router, debug_handler, error_handling::HandleErrorLayer, extract::{OriginalUri, State}, http::{StatusCode, header}, response::{IntoResponse, Response}, routing::get
+    Router, debug_handler, extract::{OriginalUri, State}, http::{StatusCode, header}, response::Response, routing::get
 };
 use axum::body::Body;
 use reqwest::{Url, header::CONTENT_TYPE};
@@ -10,7 +10,7 @@ use sticknodes_rs::Stickfigure;
 use tokio::{net::{TcpListener, lookup_host}, sync::Semaphore};
 use base64::prelude::*;
 use futures_util::StreamExt;
-use tower::{BoxError, ServiceBuilder};
+use tower::ServiceBuilder;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use crate::utils::render::render_to_png;
@@ -19,8 +19,9 @@ mod utils;
 
 const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
 const ALLOWED_HOSTS: &[&str] = &[
-    // "raw.githubusercontent.com",
+    "raw.githubusercontent.com",
     "sticknodes.com",
+    "cdn.discordapp.com",
 ];
 
 #[derive(Clone)]
@@ -84,89 +85,145 @@ fn is_ip_allowed(ip: IpAddr) -> bool {
     }
 }
 
-async fn handle_governor_error(err: BoxError) -> impl IntoResponse {
-    if err.is::<tower_governor::errors::GovernorError>() {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "Rate limit exceeded",
-        );
-    }
-
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Unhandled internal error",
-    )
-}
-
 #[debug_handler]
 async fn handle(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, StatusCode> {
+
+    println!("---- NEW REQUEST ----");
+    println!("URI: {}", uri);
+
     // Acquire concurrency permit
-    let _permit = state.semaphore
-        .acquire()
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let _permit = match state.semaphore.acquire().await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Semaphore acquire failed: {e}");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
 
     let path = uri.path();
-    let target_url = path.strip_prefix('/')
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    println!("Path: {path}");
 
-        let url = Url::parse(target_url)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    
-    // Enforce HTTPS only
+    let target_url = match path.strip_prefix('/') {
+        Some(p) => p,
+        None => {
+            eprintln!("Missing leading slash");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    println!("Target URL raw: {target_url}");
+
+    let url = match Url::parse(target_url) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("URL parse failed: {e}");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
     if url.scheme() != "https" {
+        eprintln!("Rejected non-https scheme: {}", url.scheme());
         return Err(StatusCode::BAD_REQUEST);
     }
-    
-    // Hostname required
-    let host = url.host_str()
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    
-    // Exact whitelist match
+
+    let host = match url.host_str() {
+        Some(h) => h,
+        None => {
+            eprintln!("No host in URL");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    println!("Host: {host}");
+
     if !ALLOWED_HOSTS.contains(&host) {
+        eprintln!("Host not allowed: {host}");
         return Err(StatusCode::FORBIDDEN);
     }
-    
-    // Resolve DNS manually to prevent DNS rebinding
-    let port = url.port_or_known_default()
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    
-    let addrs: Vec<SocketAddr> = lookup_host((host, port))
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?
-        .collect();
-    
+
+    let port = match url.port_or_known_default() {
+        Some(p) => p,
+        None => {
+            eprintln!("No port resolved");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    println!("Resolving {host}:{port}");
+
+    let addrs: Vec<SocketAddr> = match lookup_host((host, port)).await {
+        Ok(a) => a.collect(),
+        Err(e) => {
+            eprintln!("DNS lookup failed: {e}");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+
     if addrs.is_empty() {
+        eprintln!("DNS returned no addresses");
         return Err(StatusCode::BAD_GATEWAY);
     }
-    
-    // Ensure all resolved IPs are safe
+
     for addr in &addrs {
+        println!("Resolved IP: {}", addr.ip());
         if !is_ip_allowed(addr.ip()) {
+            eprintln!("Rejected IP: {}", addr.ip());
             return Err(StatusCode::FORBIDDEN);
         }
     }
 
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none()) // important
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Client build failed: {e}");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
 
-    let resp = client.get(target_url)
-        .send()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    println!("Fetching remote file...");
+
+    let resp = match client
+    .get(target_url)
+    .header("User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+         AppleWebKit/537.36 (KHTML, like Gecko) \
+         Chrome/122.0.0.0 Safari/537.36")
+    .header("Accept", "*/*")
+    .header("Referer", "https://sticknodes.com/")
+    .header("Accept-Language", "en-US,en;q=0.9")
+    .header("Accept-Encoding", "gzip, deflate, br")
+    .header("Connection", "keep-alive")
+    .header("sec-fetch-dest", "image")
+    .header("sec-fetch-mode", "no-cors")
+    .header("sec-fetch-site", "cross-site")
+    .send()
+    .await
+{
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("HTTP request failed: {e}");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+
+    println!("Remote status: {}", resp.status());
 
     if !resp.status().is_success() {
+        eprintln!("Remote returned non-success: {}", resp.status());
         return Err(StatusCode::BAD_GATEWAY);
     }
 
     if let Some(len) = resp.content_length() {
+        println!("Content-Length: {len}");
         if len > MAX_SIZE {
+            eprintln!("File too large: {len}");
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
     }
@@ -175,35 +232,66 @@ async fn handle(
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
 
+    println!("Content-Type: {:?}", content_type);
+
     if content_type != Some("application/octet-stream") {
+        eprintln!("Unsupported content type: {:?}", content_type);
         return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
+
+    println!("Streaming body...");
 
     let mut stream = resp.bytes_stream();
     let mut total: u64 = 0;
     let mut buffer = Vec::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Stream error: {e}");
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+        };
+
         total += chunk.len() as u64;
 
         if total > MAX_SIZE {
+            eprintln!("Exceeded max size during stream: {total}");
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
 
         buffer.extend_from_slice(&chunk);
     }
 
-    let compiled = {
+    println!("Downloaded {} bytes", total);
+
+    println!("Parsing Stickfigure...");
+
+    let compiled = match catch_unwind(AssertUnwindSafe(|| {
         let stickfigure = Stickfigure::from_bytes(buffer)
-        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+            .expect("Stickfigure::from_bytes failed");
 
         compile_frame(&stickfigure)
+    })) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("compile_frame panicked!");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     };
 
-    let png_bytes = render_to_png(&compiled)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    println!("Rendering PNG...");
+
+    let png_bytes = match render_to_png(&compiled).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("render_to_png failed: {:?}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    println!("PNG size: {}", png_bytes.len());
 
     let base64_img = BASE64_STANDARD.encode(&png_bytes);
 
@@ -223,6 +311,8 @@ async fn handle(
         </html>
         "#
     );
+
+    println!("Returning OK response");
 
     Ok(Response::builder()
         .status(StatusCode::OK)
