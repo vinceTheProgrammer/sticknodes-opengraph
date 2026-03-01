@@ -11,7 +11,7 @@ wgpu = "0.19"
 image = "0.25"
 bytes = "1"
 snrs-render-core = { path = "../snrs-render-core" }
-sticknodes-rs = { path = "../sticknodes-rs", features = ["std"] }
+sticknodes-rs = { path = "../sticknodes-rs", features = ["std", "tryreadanyway"] }
 anyhow = "1.0.102"
 base64 = "0.22.1"
 bytemuck = { version = "1.25", features = ["derive"] }
