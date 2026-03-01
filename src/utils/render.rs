@@ -19,6 +19,28 @@ struct Uniforms {
     transform: [[f32; 4]; 4],
 }
 
+pub struct Renderer {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+}
+
+impl Renderer {
+    pub async fn new() -> Result<Self> {
+        let instance = wgpu::Instance::default();
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No suitable GPU adapters found"))?;
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .await?;
+
+        Ok(Self { device, queue })
+    }
+}
+
 impl GpuVertex {
     fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
         use std::mem;
@@ -43,7 +65,10 @@ impl GpuVertex {
     }
 }
 
-pub async fn render_to_png(frame: &CompiledFrame) -> Result<Vec<u8>> {
+pub async fn render_to_png(
+    renderer: &Renderer,
+    frame: &CompiledFrame,
+) -> Result<Vec<u8>> {
     let width: u32 = 1024;
     let height: u32 = 1024;
 
@@ -81,53 +106,44 @@ pub async fn render_to_png(frame: &CompiledFrame) -> Result<Vec<u8>> {
     // Final matrix
     let final_matrix = ndc * scale_mat * translate;
 
-    // --- Instance / Adapter / Device ---
-    let instance = wgpu::Instance::default();
+    let device = &renderer.device;
+    let queue = &renderer.queue;
 
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await
-        .ok_or_else(|| anyhow::anyhow!("No suitable GPU adapters found"))?;
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Shader"),
+        source: wgpu::ShaderSource::Wgsl(r#"
+            struct Uniforms {
+                transform: mat4x4<f32>,
+            };
 
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor::default(), None)
-        .await?;
+            @group(0) @binding(0)
+            var<uniform> uniforms: Uniforms;
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(r#"
-                struct Uniforms {
-                    transform: mat4x4<f32>,
-                };
-    
-                @group(0) @binding(0)
-                var<uniform> uniforms: Uniforms;
-    
-                struct VertexOut {
-                    @builtin(position) position: vec4<f32>,
-                    @location(0) color: vec4<f32>,
-                };
-    
-                @vertex
-                fn vs_main(
-                    @location(0) position: vec2<f32>,
-                    @location(1) color: vec4<f32>
-                ) -> VertexOut {
-                    var out: VertexOut;
-    
-                    let pos = vec4<f32>(position, 0.0, 1.0);
-                    out.position = uniforms.transform * pos;
-    
-                    out.color = color;
-                    return out;
-                }
-    
-                @fragment
-                fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-                    return in.color;
-                }
-            "#.into()),
-        });
+            struct VertexOut {
+                @builtin(position) position: vec4<f32>,
+                @location(0) color: vec4<f32>,
+            };
+
+            @vertex
+            fn vs_main(
+                @location(0) position: vec2<f32>,
+                @location(1) color: vec4<f32>
+            ) -> VertexOut {
+                var out: VertexOut;
+
+                let pos = vec4<f32>(position, 0.0, 1.0);
+                out.position = uniforms.transform * pos;
+
+                out.color = color;
+                return out;
+            }
+
+            @fragment
+            fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+                return in.color;
+            }
+        "#.into()),
+    });
 
     // --- Render Target Texture ---
     let texture = device.create_texture(&wgpu::TextureDescriptor {

@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use tower::ServiceBuilder;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
-use crate::utils::render::render_to_png;
+use crate::utils::render::{Renderer, render_to_png};
 
 mod utils;
 
@@ -27,12 +27,15 @@ const ALLOWED_HOSTS: &[&str] = &[
 #[derive(Clone)]
 struct AppState {
     semaphore: Arc<Semaphore>,
+    renderer: Arc<Renderer>,
 }
 
 #[tokio::main]
 async fn main() {
+    let renderer = Arc::new(Renderer::new().await.unwrap());
     let state = AppState {
         semaphore: Arc::new(Semaphore::new(16)),
+        renderer
     };
 
     let governor_conf = Arc::new(
@@ -44,7 +47,8 @@ async fn main() {
     );
 
     let app = Router::new()
-    .route("/*path", get(handle))
+    .route("/view/*path", get(handle_view))
+    .route("/png/*path", get(handle_png))
     .with_state(state)
     .layer(
         ServiceBuilder::new()
@@ -86,35 +90,30 @@ fn is_ip_allowed(ip: IpAddr) -> bool {
 }
 
 #[debug_handler]
-async fn handle(
+async fn handle_png(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, StatusCode> {
 
-    println!("---- NEW REQUEST ----");
-    println!("URI: {}", uri);
+    let path = uri
+        .path()
+        .strip_prefix("/png/")
+        .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // Acquire concurrency permit
-    let _permit = match state.semaphore.acquire().await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Semaphore acquire failed: {e}");
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-    };
+    let decoded = urlencoding::decode(path)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let path = uri.path();
-    println!("Path: {path}");
+    let png_bytes = render_from_url(&state.renderer, &decoded).await?;
 
-    let target_url = match path.strip_prefix('/') {
-        Some(p) => p,
-        None => {
-            eprintln!("Missing leading slash");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(Body::from(png_bytes))
+        .unwrap())
+}
 
-    println!("Target URL raw: {target_url}");
+async fn render_from_url(renderer: &Renderer, target_url: &str) -> Result<Vec<u8>, StatusCode> {
 
     let url = match Url::parse(target_url) {
         Ok(u) => u,
@@ -283,7 +282,7 @@ async fn handle(
 
     println!("Rendering PNG...");
 
-    let png_bytes = match render_to_png(&compiled).await {
+    let png_bytes = match render_to_png(renderer, &compiled).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("render_to_png failed: {:?}", e);
@@ -291,25 +290,56 @@ async fn handle(
         }
     };
 
+    Ok(png_bytes)
+}
+
+#[debug_handler]
+async fn handle_view(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, StatusCode> {
+
+    println!("---- NEW REQUEST ----");
+    println!("URI: {}", uri);
+
+    // Acquire concurrency permit
+    let _permit = match state.semaphore.acquire().await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Semaphore acquire failed: {e}");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+
+    let target_url = uri
+        .path()
+        .strip_prefix("/view/")
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    println!("Target URL raw: {target_url}");
+
+    let Ok(png_bytes) = render_from_url(&state.renderer, target_url).await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR)
+    };
+
     println!("PNG size: {}", png_bytes.len());
 
-    let base64_img = BASE64_STANDARD.encode(&png_bytes);
+    let encoded = urlencoding::encode(target_url);
+    let png_url = format!("http://127.0.0.1:3000/png/{encoded}");
 
     let html = format!(
-        r#"
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta property="og:title" content="Rendered Stickfigure" />
-            <meta property="og:image" content="data:image/png;base64,{base64_img}" />
-            <meta property="og:type" content="website" />
-        </head>
-        <body style="margin:0; background:#111; display:flex; justify-content:center; align-items:center; min-height:100vh;">
-            <img src="data:image/png;base64,{base64_img}" style="max-width:90vw; max-height:90vh;" />
-        </body>
-        </html>
-        "#
+    r#"<!DOCTYPE html>
+    <html>
+    <head>
+    <meta property="og:title" content="Rendered Stickfigure" />
+    <meta property="og:image" content="{png_url}" />
+    <meta property="og:type" content="website" />
+    <meta property="og:image:type" content="image/png" />
+    </head>
+    <body>
+    <img src="{png_url}" />
+    </body>
+    </html>"#
     );
 
     println!("Returning OK response");
