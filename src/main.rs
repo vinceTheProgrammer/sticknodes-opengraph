@@ -1,65 +1,73 @@
-use std::{net::{IpAddr, SocketAddr}, sync::Arc, time::Duration};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use axum::{
-    Router, debug_handler, extract::{OriginalUri, State}, http::{StatusCode, header}, response::Response, routing::get
+use std::{
+    path::PathBuf,
+    sync::Arc,
 };
-use axum::body::Body;
-use reqwest::{Url, header::CONTENT_TYPE};
+
+use axum::{
+    Json, Router, body::Body, debug_handler, extract::{Multipart, Path as AxumPath, State}, http::{StatusCode, header}, response::{Html, Response}, routing::get
+};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tokio::{fs, sync::Semaphore};
+use tower::ServiceBuilder;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+
 use snrs_render_core::compile_frame;
 use sticknodes_rs::Stickfigure;
-use tokio::{net::{TcpListener, lookup_host}, sync::Semaphore};
-use base64::prelude::*;
-use futures_util::StreamExt;
-use tower::ServiceBuilder;
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
-use crate::utils::render::{Renderer, render_to_png};
+use crate::utils::render::{render_to_png, Renderer};
 
 mod utils;
 
-const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
-const ALLOWED_HOSTS: &[&str] = &[
-    "raw.githubusercontent.com",
-    "sticknodes.com",
-    "cdn.discordapp.com",
-];
+const MAX_SIZE: usize = 5 * 1024 * 1024; // 5MB
 
 #[derive(Clone)]
 struct AppState {
-    semaphore: Arc<Semaphore>,
     renderer: Arc<Renderer>,
+    semaphore: Arc<Semaphore>,
+    data_dir: PathBuf,
 }
 
 #[tokio::main]
 async fn main() {
     let renderer = Arc::new(Renderer::new().await.unwrap());
+
+    let data_dir = std::env::var("RENDER_DATA_DIR")
+    .unwrap_or_else(|_| "/var/lib/render-service".to_string());
+
+    let data_dir = PathBuf::from(data_dir);
+    
+    fs::create_dir_all(data_dir.join("nodes")).await.unwrap();
+    fs::create_dir_all(data_dir.join("png")).await.unwrap();
+
     let state = AppState {
+        renderer,
         semaphore: Arc::new(Semaphore::new(16)),
-        renderer
+        data_dir,
     };
 
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(1)      // 1 request per second per IP
-            .burst_size(5)      // allow bursts of 5
+            .per_second(2)
+            .burst_size(5)
             .finish()
-            .unwrap()
+            .unwrap(),
     );
 
     let app = Router::new()
-    .route("/view/*path", get(handle_view))
-    .route("/png/*path", get(handle_png))
-    .with_state(state)
-    .layer(
-        ServiceBuilder::new()
-            .layer(GovernorLayer {
-                config: governor_conf
-            })
-    );
+        .route("/", get(root_page).post(upload_nodes))
+        .route("/p/:id", get(og_page))
+        .route("/p/:id/png", get(get_png))
+        .with_state(state)
+        .layer(ServiceBuilder::new().layer(GovernorLayer {
+            config: governor_conf,
+        }));
 
-    let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
 
-    println!("Listening on {}", listener.local_addr().unwrap());
+    println!("Listening on http://127.0.0.1:3000");
 
     axum::serve(
         listener,
@@ -69,284 +77,271 @@ async fn main() {
     .unwrap();
 }
 
-fn is_ip_allowed(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            !(v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.octets()[0] == 0)
-        }
-        IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_multicast()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local())
-        }
-    }
+async fn root_page() -> Html<&'static str> {
+    Html(r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Sticknodes Renderer</title>
+<style>
+body {
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+    display: flex;
+    justify-content: center;
+    padding: 40px;
+}
+.container {
+    max-width: 700px;
+    width: 100%;
+}
+h1 {
+    margin-bottom: 10px;
+}
+.card {
+    background: #1e1e1e;
+    padding: 20px;
+    border-radius: 8px;
+}
+input[type="file"] {
+    margin-top: 10px;
+    margin-bottom: 15px;
+    color: #ccc;
+}
+button {
+    background: #4f46e5;
+    border: none;
+    padding: 8px 14px;
+    color: white;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+}
+button:hover {
+    background: #6366f1;
+}
+.upload-area {
+    border: 2px dashed #333;
+    padding: 30px;
+    text-align: center;
+    border-radius: 8px;
+    margin-bottom: 15px;
+}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Sticknodes Renderer</h1>
+
+<div class="card">
+<form method="POST" enctype="multipart/form-data">
+<div class="upload-area">
+<p>Select a <strong>.nodes</strong> file to render</p>
+<input type="file" name="file" accept=".nodes" required />
+</div>
+<button type="submit">Render</button>
+</form>
+</div>
+
+</div>
+</body>
+</html>"#)
+}
+
+#[derive(Serialize)]
+struct UploadResponse {
+    id: String,
+    png_url: String,
+    og_url: String,
 }
 
 #[debug_handler]
-async fn handle_png(
+async fn upload_nodes(
     State(state): State<AppState>,
-    OriginalUri(uri): OriginalUri,
-) -> Result<Response, StatusCode> {
+    mut multipart: Multipart,
+) -> Result<Html<String>, StatusCode> {
+    let _permit = state.semaphore.acquire().await.unwrap();
 
-    let path = uri
-        .path()
-        .strip_prefix("/png/")
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let mut file_bytes = Vec::new();
 
-    let decoded = urlencoding::decode(path)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let png_bytes = render_from_url(&state.renderer, &decoded).await?;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "image/png")
-        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-        .body(Body::from(png_bytes))
-        .unwrap())
-}
-
-async fn render_from_url(renderer: &Renderer, target_url: &str) -> Result<Vec<u8>, StatusCode> {
-
-    let url = match Url::parse(target_url) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("URL parse failed: {e}");
-            return Err(StatusCode::BAD_REQUEST);
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        if field.name() == Some("file") {
+            file_bytes = field.bytes().await.unwrap().to_vec();
+            break;
         }
-    };
+    }
 
-    if url.scheme() != "https" {
-        eprintln!("Rejected non-https scheme: {}", url.scheme());
+    if file_bytes.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let host = match url.host_str() {
-        Some(h) => h,
-        None => {
-            eprintln!("No host in URL");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
-
-    println!("Host: {host}");
-
-    if !ALLOWED_HOSTS.contains(&host) {
-        eprintln!("Host not allowed: {host}");
-        return Err(StatusCode::FORBIDDEN);
+    if file_bytes.len() > MAX_SIZE {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    let port = match url.port_or_known_default() {
-        Some(p) => p,
-        None => {
-            eprintln!("No port resolved");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
+    // Hash file
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&file_bytes);
+    let id = format!("{:x}", hasher.finalize());
 
-    println!("Resolving {host}:{port}");
+    let nodes_path = state.data_dir.join("nodes").join(format!("{id}.nodes"));
+    let png_path = state.data_dir.join("png").join(format!("{id}.png"));
 
-    let addrs: Vec<SocketAddr> = match lookup_host((host, port)).await {
-        Ok(a) => a.collect(),
-        Err(e) => {
-            eprintln!("DNS lookup failed: {e}");
-            return Err(StatusCode::BAD_GATEWAY);
-        }
-    };
-
-    if addrs.is_empty() {
-        eprintln!("DNS returned no addresses");
-        return Err(StatusCode::BAD_GATEWAY);
-    }
-
-    for addr in &addrs {
-        println!("Resolved IP: {}", addr.ip());
-        if !is_ip_allowed(addr.ip()) {
-            eprintln!("Rejected IP: {}", addr.ip());
-            return Err(StatusCode::FORBIDDEN);
-        }
-    }
-
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Client build failed: {e}");
-            return Err(StatusCode::BAD_GATEWAY);
-        }
-    };
-
-    println!("Fetching remote file...");
-
-    let resp = match client
-    .get(target_url)
-    .header("User-Agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-         AppleWebKit/537.36 (KHTML, like Gecko) \
-         Chrome/122.0.0.0 Safari/537.36")
-    .header("Accept", "*/*")
-    .header("Referer", "https://sticknodes.com/")
-    .header("Accept-Language", "en-US,en;q=0.9")
-    .header("Accept-Encoding", "gzip, deflate, br")
-    .header("Connection", "keep-alive")
-    .header("sec-fetch-dest", "image")
-    .header("sec-fetch-mode", "no-cors")
-    .header("sec-fetch-site", "cross-site")
-    .send()
-    .await
-{
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("HTTP request failed: {e}");
-            return Err(StatusCode::BAD_GATEWAY);
-        }
-    };
-
-    println!("Remote status: {}", resp.status());
-
-    if !resp.status().is_success() {
-        eprintln!("Remote returned non-success: {}", resp.status());
-        return Err(StatusCode::BAD_GATEWAY);
-    }
-
-    if let Some(len) = resp.content_length() {
-        println!("Content-Length: {len}");
-        if len > MAX_SIZE {
-            eprintln!("File too large: {len}");
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
-        }
-    }
-
-    let content_type = resp.headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok());
-
-    println!("Content-Type: {:?}", content_type);
-
-    if content_type != Some("application/octet-stream") {
-        eprintln!("Unsupported content type: {:?}", content_type);
-        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    }
-
-    println!("Streaming body...");
-
-    let mut stream = resp.bytes_stream();
-    let mut total: u64 = 0;
-    let mut buffer = Vec::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Stream error: {e}");
-                return Err(StatusCode::BAD_GATEWAY);
-            }
+    if !png_path.exists() {
+        
+        let compiled = {
+            let stickfigure =
+            Stickfigure::from_bytes(file_bytes.clone())
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            compile_frame(&stickfigure)
         };
 
-        total += chunk.len() as u64;
+        let png_bytes =
+            render_to_png(&state.renderer, &compiled)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        if total > MAX_SIZE {
-            eprintln!("Exceeded max size during stream: {total}");
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
-        }
+        tokio::fs::write(&nodes_path, &file_bytes)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        buffer.extend_from_slice(&chunk);
+        tokio::fs::write(&png_path, png_bytes)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
 
-    println!("Downloaded {} bytes", total);
+    // Build absolute URLs
+    let png_url = format!("/p/{id}/png");
+    let og_url = format!("/p/{id}");
 
-    println!("Parsing Stickfigure...");
+    let html = format!(r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Render Complete</title>
+<style>
+body {{
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+    display: flex;
+    justify-content: center;
+    padding: 40px;
+}}
+.container {{
+    max-width: 700px;
+    width: 100%;
+}}
+h1 {{
+    margin-bottom: 10px;
+}}
+img {{
+    max-width: 100%;
+    background: #222;
+    padding: 10px;
+    border-radius: 8px;
+}}
+.link-box {{
+    background: #1e1e1e;
+    padding: 10px;
+    margin-top: 15px;
+    border-radius: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 14px;
+}}
+button {{
+    background: #4f46e5;
+    border: none;
+    padding: 6px 10px;
+    color: white;
+    border-radius: 4px;
+    cursor: pointer;
+}}
+button:hover {{
+    background: #6366f1;
+}}
+a {{
+    color: #93c5fd;
+    text-decoration: none;
+}}
+</style>
+<script>
+function copyToClipboard(text) {{
+    navigator.clipboard.writeText(text);
+}}
+</script>
+</head>
+<body>
+<div class="container">
+<h1>Render Complete ✅</h1>
 
-    let compiled = match catch_unwind(AssertUnwindSafe(|| {
-        let stickfigure = Stickfigure::from_bytes(buffer)
-            .expect("Stickfigure::from_bytes failed");
+<img src="{png_url}" />
 
-        compile_frame(&stickfigure)
-    })) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("compile_frame panicked!");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
+<div class="link-box">
+<span>{png_url}</span>
+<button onclick="copyToClipboard(window.location.origin + '{png_url}')">Copy PNG</button>
+</div>
 
-    println!("Rendering PNG...");
+<div class="link-box">
+<span>{og_url}</span>
+<button onclick="copyToClipboard(window.location.origin + '{og_url}')">Copy Share Link</button>
+</div>
 
-    let png_bytes = match render_to_png(renderer, &compiled).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("render_to_png failed: {:?}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
+<br>
+<a href="/">Upload another</a>
 
-    Ok(png_bytes)
+</div>
+</body>
+</html>"#);
+
+    Ok(Html(html))
 }
 
-#[debug_handler]
-async fn handle_view(
+async fn get_png(
     State(state): State<AppState>,
-    OriginalUri(uri): OriginalUri,
+    AxumPath(id): AxumPath<String>,
 ) -> Result<Response, StatusCode> {
+    let path = state.data_dir.join("png").join(format!("{id}.png"));
 
-    println!("---- NEW REQUEST ----");
-    println!("URI: {}", uri);
-
-    // Acquire concurrency permit
-    let _permit = match state.semaphore.acquire().await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Semaphore acquire failed: {e}");
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-    };
-
-    let target_url = uri
-        .path()
-        .strip_prefix("/view/")
-        .ok_or(StatusCode::BAD_REQUEST)?;
-
-    println!("Target URL raw: {target_url}");
-
-    let Ok(png_bytes) = render_from_url(&state.renderer, target_url).await else {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR)
-    };
-
-    println!("PNG size: {}", png_bytes.len());
-
-    let encoded = urlencoding::encode(target_url);
-    let png_url = format!("http://127.0.0.1:3000/png/{encoded}");
-
-    let html = format!(
-    r#"<!DOCTYPE html>
-    <html>
-    <head>
-    <meta property="og:title" content="Rendered Stickfigure" />
-    <meta property="og:image" content="{png_url}" />
-    <meta property="og:type" content="website" />
-    <meta property="og:image:type" content="image/png" />
-    </head>
-    <body>
-    <img src="{png_url}" />
-    </body>
-    </html>"#
-    );
-
-    println!("Returning OK response");
+    let bytes = fs::read(path).await.map_err(|_| StatusCode::NOT_FOUND)?;
 
     Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(Body::from(html))
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(Body::from(bytes))
         .unwrap())
+}
+
+async fn og_page(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Html<String>, StatusCode> {
+    let png_path = state.data_dir.join("png").join(format!("{id}.png"));
+
+    if !png_path.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let png_url = format!("/p/{id}/png");
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<meta property="og:title" content="Rendered Stickfigure" />
+<meta property="og:image" content="{png_url}" />
+<meta property="og:type" content="website" />
+<meta property="og:image:type" content="image/png" />
+</head>
+<body>
+<img src="{png_url}" />
+</body>
+</html>"#
+    );
+
+    Ok(Html(html))
 }
